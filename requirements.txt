@@ -2,3 +2,8 @@ python-dotenv
 google-api-python-client
 pandas
 pyarrow
+textblob
+streamlit
+plotly
+streamlit
+plotly
