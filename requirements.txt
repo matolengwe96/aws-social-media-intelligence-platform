@@ -7,3 +7,11 @@ streamlit
 plotly
 streamlit
 plotly
+openai
+streamlit
+pandas
+plotly
+pyarrow
+python-dotenv
+google-api-python-client
+openai
