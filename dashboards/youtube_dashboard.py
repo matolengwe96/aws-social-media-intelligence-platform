@@ -16,11 +16,28 @@ st.set_page_config(
 
 
 @st.cache_data
-def load_data():
+def load_data() -> pd.DataFrame:
     df = pd.read_parquet(GOLD_COMMENTS_PATH)
+
     df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce")
-    df["date"] = df["published_at"].dt.date
+    df["date"] = df["published_at"].dt.to_period("M").dt.to_timestamp()
+
+    df["clean_text"] = df["clean_text"].fillna("")
+    df["author"] = df["author"].fillna("Unknown")
+    df["likes"] = pd.to_numeric(df["likes"], errors="coerce").fillna(0)
+    df["sentiment_score"] = pd.to_numeric(
+        df["sentiment_score"], errors="coerce"
+    ).fillna(0)
+
     return df
+
+
+def safe_average_likes(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 0.0
+
+    capped_likes = df["likes"].clip(upper=df["likes"].quantile(0.95))
+    return round(capped_likes.mean(), 2)
 
 
 def generate_ai_insights(df: pd.DataFrame) -> list[str]:
@@ -37,7 +54,8 @@ def generate_ai_insights(df: pd.DataFrame) -> list[str]:
     neutral_pct = round((neutral_count / total_comments) * 100, 2)
     negative_pct = round((negative_count / total_comments) * 100, 2)
 
-    avg_likes = round(df["likes"].mean(), 2)
+    avg_likes = safe_average_likes(df)
+    max_likes = int(df["likes"].max())
     most_liked = df.sort_values("likes", ascending=False).iloc[0]
 
     insights = []
@@ -49,29 +67,33 @@ def generate_ai_insights(df: pd.DataFrame) -> list[str]:
     )
 
     insights.append(
-        f"Average engagement is {avg_likes} likes per comment. "
-        f"The most liked comment is from {most_liked['author']} with "
-        f"{most_liked['likes']} likes."
+        f"Typical engagement is around {avg_likes} likes per comment after reducing "
+        f"the effect of extreme outliers. The most liked comment is from "
+        f"{most_liked['author']} with {max_likes:,} likes."
     )
+
+    if max_likes > df["likes"].mean() * 10 and max_likes > 100:
+        insights.append(
+            "An unusual engagement spike was detected. One comment has significantly "
+            "more likes than the rest, so average engagement should be interpreted carefully."
+        )
 
     if negative_pct >= 20:
         insights.append(
-            "Negative sentiment is relatively high. This should be investigated "
-            "because it may indicate dissatisfaction, controversy, or audience concern."
+            "Negative sentiment is relatively high. This may indicate dissatisfaction, "
+            "controversy, or audience concern that should be investigated."
         )
     elif negative_pct > 0:
         insights.append(
-            "Negative sentiment is present but low. Monitor the negative comments "
-            "to understand whether they represent isolated complaints or early warning signals."
+            "Negative sentiment is present but low. Monitor the negative comments to check "
+            "whether they are isolated complaints or early warning signals."
         )
     else:
-        insights.append(
-            "No negative comments were detected in the current filtered dataset."
-        )
+        insights.append("No negative comments were detected in the current filtered dataset.")
 
     if positive_pct > negative_pct:
         insights.append(
-            "Overall audience response is healthier than risky because positive sentiment "
+            "Overall audience response appears healthier than risky because positive sentiment "
             "is stronger than negative sentiment."
         )
     elif negative_pct > positive_pct:
@@ -83,15 +105,35 @@ def generate_ai_insights(df: pd.DataFrame) -> list[str]:
             "Positive and negative sentiment are balanced, so the conversation is not clearly leaning either way."
         )
 
+    top_negative = (
+        df[df["sentiment_label"] == "negative"]
+        .sort_values("sentiment_score", ascending=True)
+        .head(3)
+    )
+
+    if not top_negative.empty:
+        negative_examples = "; ".join(top_negative["clean_text"].tolist())
+        insights.append(f"Sample negative feedback: {negative_examples}")
+
+    top_positive = (
+        df[df["sentiment_label"] == "positive"]
+        .sort_values("sentiment_score", ascending=False)
+        .head(3)
+    )
+
+    if not top_positive.empty:
+        positive_examples = "; ".join(top_positive["clean_text"].tolist())
+        insights.append(f"Sample positive feedback: {positive_examples}")
+
     return insights
 
 
-def main():
+def main() -> None:
     st.title("SocialPulse AI")
     st.subheader("YouTube Social Media Intelligence Dashboard")
 
     if not GOLD_COMMENTS_PATH.exists():
-        st.error("Run gold transformation first.")
+        st.error("Gold data not found. Run: python src/transformation/youtube_to_gold.py")
         return
 
     df = load_data()
@@ -127,7 +169,7 @@ def main():
         ]
 
     total = len(filtered)
-    avg_likes = filtered["likes"].mean() if total > 0 else 0
+    avg_likes = safe_average_likes(filtered)
     pos = (filtered["sentiment_label"] == "positive").sum()
     neu = (filtered["sentiment_label"] == "neutral").sum()
     neg = (filtered["sentiment_label"] == "negative").sum()
@@ -135,7 +177,7 @@ def main():
     c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric("Total Comments", total)
-    c2.metric("Avg Likes", round(avg_likes, 2))
+    c2.metric("Avg Likes", avg_likes)
     c3.metric("Positive", pos)
     c4.metric("Neutral", neu)
     c5.metric("Negative", neg)
@@ -148,9 +190,7 @@ def main():
 
     st.subheader("AI Insights Summary")
 
-    insights = generate_ai_insights(filtered)
-
-    for insight in insights:
+    for insight in generate_ai_insights(filtered):
         st.info(insight)
 
     st.divider()
@@ -175,14 +215,14 @@ def main():
 
         avg_likes_sent = (
             filtered.groupby("sentiment_label")["likes"]
-            .mean()
-            .reset_index()
+            .apply(lambda x: x.clip(upper=x.quantile(0.95)).mean())
+            .reset_index(name="avg_likes")
         )
 
         fig = px.bar(
             avg_likes_sent,
             x="sentiment_label",
-            y="likes",
+            y="avg_likes",
             text_auto=True,
         )
         st.plotly_chart(fig, use_container_width=True)
@@ -281,6 +321,19 @@ def main():
             ]
         ],
         use_container_width=True,
+    )
+
+    st.divider()
+
+    st.subheader("Export Filtered Data")
+
+    csv_data = filtered.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="Download filtered comments as CSV",
+        data=csv_data,
+        file_name="socialpulse_filtered_comments.csv",
+        mime="text/csv",
     )
 
 
