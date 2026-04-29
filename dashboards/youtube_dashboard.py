@@ -22,6 +22,7 @@ def load_data() -> pd.DataFrame:
     df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce")
     df["month"] = df["published_at"].dt.to_period("M").dt.to_timestamp()
 
+    df["video_id"] = df["video_id"].fillna("unknown")
     df["author"] = df["author"].fillna("Unknown")
     df["clean_text"] = df["clean_text"].fillna("")
     df["sentiment_label"] = df["sentiment_label"].fillna("neutral")
@@ -44,11 +45,15 @@ def adjusted_average(series: pd.Series) -> float:
 
 def filter_data(
     df: pd.DataFrame,
+    video_id: str,
     sentiment: str,
     min_likes: int,
     search_text: str,
 ) -> pd.DataFrame:
     filtered = df.copy()
+
+    if video_id != "all":
+        filtered = filtered[filtered["video_id"] == video_id]
 
     if sentiment != "all":
         filtered = filtered[filtered["sentiment_label"] == sentiment]
@@ -81,40 +86,54 @@ def generate_insights(df: pd.DataFrame) -> list[str]:
     most_liked = df.sort_values("likes", ascending=False).iloc[0]
     max_likes = int(most_liked["likes"])
 
+    top_video = (
+        df.groupby("video_id")["likes"]
+        .sum()
+        .reset_index(name="total_likes")
+        .sort_values("total_likes", ascending=False)
+        .iloc[0]
+    )
+
     insights = [
         (
-            f"The current selection contains {total} analyzed comments. "
-            f"Neutral sentiment leads at {neutral_pct}%, followed by "
-            f"positive sentiment at {positive_pct}% and negative sentiment at {negative_pct}%."
+            f"The current selection contains {total} analyzed comments across "
+            f"{df['video_id'].nunique()} video(s). Neutral sentiment leads at "
+            f"{neutral_pct}%, followed by positive sentiment at {positive_pct}% "
+            f"and negative sentiment at {negative_pct}%."
         ),
         (
-            f"Average likes including viral outliers is {raw_avg}, while typical average likes "
-            f"is {typical_avg}. This means engagement is strongly affected by one or more "
-            f"high-performing comments."
+            f"Average likes including viral outliers is {raw_avg}, while typical "
+            f"average likes is {typical_avg}. This indicates that engagement is "
+            f"affected by one or more high-performing comments."
         ),
         (
-            f"The most liked comment is from {most_liked['author']} with {max_likes:,} likes."
+            f"The most liked comment is from {most_liked['author']} with "
+            f"{max_likes:,} likes."
+        ),
+        (
+            f"The strongest video by total comment likes is `{top_video['video_id']}` "
+            f"with {int(top_video['total_likes']):,} likes."
         ),
     ]
 
     if max_likes > df["likes"].mean() * 10 and max_likes > 100:
         insights.append(
-            "A viral engagement outlier was detected. Raw engagement metrics should therefore "
-            "be interpreted together with adjusted metrics."
+            "A viral engagement outlier was detected. Raw engagement metrics should "
+            "therefore be interpreted together with adjusted metrics."
         )
 
     if negative_pct >= 20:
         insights.append(
-            "Negative sentiment is high enough to require investigation. This may indicate "
-            "audience dissatisfaction, controversy, or reputational risk."
+            "Negative sentiment is high enough to require investigation. This may "
+            "indicate audience dissatisfaction, controversy, or reputational risk."
         )
     elif negative_pct > 0:
         insights.append(
-            "Negative sentiment exists but is currently low. These comments should still be monitored "
-            "as possible early warning signals."
+            "Negative sentiment exists but is currently low. These comments should "
+            "still be monitored as possible early warning signals."
         )
     else:
-        insights.append("No negative sentiment was detected in the current filtered dataset.")
+        insights.append("No negative sentiment was detected in the current selection.")
 
     top_negative = (
         df[df["sentiment_label"] == "negative"]
@@ -139,6 +158,106 @@ def generate_insights(df: pd.DataFrame) -> list[str]:
     return insights
 
 
+def answer_data_question(df: pd.DataFrame, question: str) -> str:
+    if not question:
+        return ""
+
+    question_lower = question.lower()
+
+    if df.empty:
+        return "No data is available for the selected filters."
+
+    if "negative" in question_lower or "complain" in question_lower:
+        negative_comments = (
+            df[df["sentiment_label"] == "negative"]
+            .sort_values("sentiment_score")
+            .head(5)
+        )
+
+        if negative_comments.empty:
+            return "No negative comments were found in the current filtered dataset."
+
+        examples = "\n".join(
+            f"- {row['clean_text']}" for _, row in negative_comments.iterrows()
+        )
+
+        return f"Here are the strongest negative comments:\n\n{examples}"
+
+    if "positive" in question_lower or "like" in question_lower:
+        positive_comments = (
+            df[df["sentiment_label"] == "positive"]
+            .sort_values("sentiment_score", ascending=False)
+            .head(5)
+        )
+
+        if positive_comments.empty:
+            return "No positive comments were found in the current filtered dataset."
+
+        examples = "\n".join(
+            f"- {row['clean_text']}" for _, row in positive_comments.iterrows()
+        )
+
+        return f"Here are the strongest positive comments:\n\n{examples}"
+
+    if "video" in question_lower or "best" in question_lower or "perform" in question_lower:
+        video_summary = build_video_summary(df).head(5)
+
+        rows = "\n".join(
+            f"- `{row['video_id']}`: {row['total_comments']} comments, "
+            f"{row['total_likes']:,} likes, {row['positive_rate']}% positive"
+            for _, row in video_summary.iterrows()
+        )
+
+        return f"Top performing videos:\n\n{rows}"
+
+    if "summary" in question_lower or "overall" in question_lower:
+        return "\n\n".join(generate_insights(df))
+
+    return (
+        "I can currently answer questions about negative comments, positive comments, "
+        "top videos, video performance, and overall summaries."
+    )
+
+
+def build_video_summary(df: pd.DataFrame) -> pd.DataFrame:
+    summary = (
+        df.groupby("video_id")
+        .agg(
+            total_comments=("clean_text", "count"),
+            total_likes=("likes", "sum"),
+            raw_avg_likes=("likes", "mean"),
+            typical_likes=("likes", adjusted_average),
+            avg_sentiment=("sentiment_score", "mean"),
+            positive_comments=(
+                "sentiment_label",
+                lambda x: (x == "positive").sum(),
+            ),
+            neutral_comments=(
+                "sentiment_label",
+                lambda x: (x == "neutral").sum(),
+            ),
+            negative_comments=(
+                "sentiment_label",
+                lambda x: (x == "negative").sum(),
+            ),
+        )
+        .reset_index()
+    )
+
+    summary["positive_rate"] = round(
+        (summary["positive_comments"] / summary["total_comments"]) * 100, 2
+    )
+
+    summary["negative_rate"] = round(
+        (summary["negative_comments"] / summary["total_comments"]) * 100, 2
+    )
+
+    summary["raw_avg_likes"] = summary["raw_avg_likes"].round(2)
+    summary["avg_sentiment"] = summary["avg_sentiment"].round(4)
+
+    return summary.sort_values("total_likes", ascending=False)
+
+
 def render_kpis(df: pd.DataFrame) -> None:
     total = len(df)
     raw_avg = round(df["likes"].mean(), 2) if total else 0.0
@@ -157,9 +276,38 @@ def render_kpis(df: pd.DataFrame) -> None:
     c5.metric("Neutral", neutral)
     c6.metric("Negative", negative)
 
-    st.caption(
-        "Typical average likes reduces the effect of extreme viral outliers."
-    )
+    st.caption("Typical average likes reduces the effect of extreme viral outliers.")
+
+
+def render_video_analytics(df: pd.DataFrame) -> None:
+    st.subheader("Video-Level Analytics")
+
+    video_summary = build_video_summary(df)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### Top Performing Videos by Likes")
+        fig = px.bar(
+            video_summary.head(10),
+            x="video_id",
+            y="total_likes",
+            title="Total Comment Likes by Video",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown("#### Sentiment Quality by Video")
+        fig = px.bar(
+            video_summary.head(10),
+            x="video_id",
+            y="positive_rate",
+            title="Positive Comment Rate by Video",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Video Performance Table")
+    st.dataframe(video_summary, use_container_width=True)
 
 
 def render_charts(df: pd.DataFrame) -> None:
@@ -259,14 +407,12 @@ def render_charts(df: pd.DataFrame) -> None:
             x="sentiment_score",
             y="likes",
             color="sentiment_label",
-            hover_data=["author", "clean_text"],
+            hover_data=["author", "clean_text", "video_id"],
             title="Normal Engagement Pattern",
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        st.caption(
-            "Extreme engagement outliers are excluded from this chart for readability."
-        )
+        st.caption("Extreme engagement outliers are excluded from this chart for readability.")
 
 
 def render_tables(df: pd.DataFrame) -> None:
@@ -277,6 +423,7 @@ def render_tables(df: pd.DataFrame) -> None:
     st.dataframe(
         top_comments[
             [
+                "video_id",
                 "author",
                 "clean_text",
                 "likes",
@@ -294,6 +441,7 @@ def render_tables(df: pd.DataFrame) -> None:
     st.dataframe(
         df[
             [
+                "video_id",
                 "author",
                 "clean_text",
                 "likes",
@@ -304,6 +452,19 @@ def render_tables(df: pd.DataFrame) -> None:
         ],
         use_container_width=True,
     )
+
+
+def render_ask_data(df: pd.DataFrame) -> None:
+    st.subheader("Ask Your Data")
+
+    question = st.text_input(
+        "Ask a question",
+        placeholder="Example: What are people complaining about?",
+    )
+
+    if question:
+        answer = answer_data_question(df, question)
+        st.markdown(answer)
 
 
 def render_export(df: pd.DataFrame) -> None:
@@ -325,18 +486,19 @@ def main() -> None:
     st.subheader("YouTube Social Media Intelligence Dashboard")
 
     if not GOLD_COMMENTS_PATH.exists():
-        st.error(
-            "Gold data not found. Run: python src/transformation/youtube_to_gold.py"
-        )
+        st.error("Gold data not found. Run: python src/transformation/youtube_to_gold.py")
         return
 
     df = load_data()
 
     st.sidebar.title("Dashboard Filters")
 
+    video_options = ["all"] + sorted(df["video_id"].dropna().unique().tolist())
     sentiment_options = ["all"] + sorted(
         df["sentiment_label"].dropna().unique().tolist()
     )
+
+    selected_video = st.sidebar.selectbox("Select video", video_options)
 
     selected_sentiment = st.sidebar.selectbox(
         "Select sentiment",
@@ -354,6 +516,7 @@ def main() -> None:
 
     filtered = filter_data(
         df=df,
+        video_id=selected_video,
         sentiment=selected_sentiment,
         min_likes=min_likes,
         search_text=search_text,
@@ -371,6 +534,14 @@ def main() -> None:
 
     for insight in generate_insights(filtered):
         st.info(insight)
+
+    st.divider()
+
+    render_video_analytics(filtered)
+
+    st.divider()
+
+    render_ask_data(filtered)
 
     st.divider()
 
